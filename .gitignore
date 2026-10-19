@@ -6,3 +6,8 @@ __pycache__/
 
 #immagini dataset
 data/hands/
+
+#modelli
+models/*.task
+
+output/
