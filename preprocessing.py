@@ -282,7 +282,73 @@ def detect_with_rotations(image, landmarker):
 
     return None, None, None
 
+def extract_geometry_features(points):
+    """Calcola 16 descrittori geometrici 2D da 21 landmark palmari.
+    Le distanze sono normalizzate rispetto alla distanza fra gli MCP
+    di indice (5) e mignolo (17), per attenuare l'effetto della scala.
+    Le misure dipendono comunque da posa e prospettiva della mano.
+    """
+    def dist(a, b):
+        return float(np.linalg.norm(points[a] - points[b]))
 
+    reference = dist(5, 17)
+    if not np.isfinite(reference) or reference < 1e-6:
+        raise ValueError("Riferimento geometrico non valido")
+
+    # Lunghezza proiettata di ciascun dito: somma dei segmenti ossei.
+    chains = {
+        "thumb": [1, 2, 3, 4],
+        "index": [5, 6, 7, 8],
+        "middle": [9, 10, 11, 12],
+        "ring": [13, 14, 15, 16],
+        "pinky": [17, 18, 19, 20],
+    }
+    lengths = {
+        finger: sum(dist(a, b) for a, b in zip(ids[:-1], ids[1:]))
+        for finger, ids in chains.items()
+    }
+
+    features = {
+        f"length_{finger}_norm": length / reference
+        for finger, length in lengths.items()
+    }
+
+    # Distanze normalizzate fra basi (MCP) delle dita adiacenti.
+    for name, a, b in [
+        ("index_middle", 5, 9),
+        ("middle_ring", 9, 13),
+        ("ring_pinky", 13, 17),
+    ]:
+        features[f"mcp_{name}_norm"] = dist(a, b) / reference
+
+    # Rapporti rispetto al dito medio, per confrontare proporzioni.
+    middle_length = lengths["middle"]
+    if middle_length < 1e-6:
+        raise ValueError("Lunghezza dito medio non valida")
+    for finger in ("thumb", "index", "ring", "pinky"):
+        features[f"ratio_{finger}_middle"] = lengths[finger] / middle_length
+
+    # Angoli di apertura tra dita vicine (sensibili alla posa).
+    directions = {
+        finger: points[ids[-1]] - points[ids[0]]
+        for finger, ids in chains.items()
+    }
+    for first, second in [
+        ("thumb", "index"),
+        ("index", "middle"),
+        ("middle", "ring"),
+        ("ring", "pinky"),
+    ]:
+        a = normalize(directions[first])
+        b = normalize(directions[second])
+        cosine = float(np.clip(np.dot(a, b), -1.0, 1.0))
+        features[f"angle_{first}_{second}_deg"] = float(
+            np.degrees(np.arccos(cosine))
+        )
+
+    if not np.all(np.isfinite(list(features.values()))):
+        raise ValueError("Feature geometriche non finite")
+    return features
 
 
 def process_image(image_path, aspect, landmarker):
@@ -302,7 +368,8 @@ def process_image(image_path, aspect, landmarker):
         "roi_discarded": 0,
         "max_size": None,
         "rotation": None,
-        "status": "unknown"
+        "status": "unknown",
+        "geometry_status": "not_attempted"
     }
 
     if image is None:
@@ -322,6 +389,13 @@ def process_image(image_path, aspect, landmarker):
     stats["hand_detected"] = True
     stats["max_size"] = max_size
     stats["rotation"] = angle
+
+    try:
+        stats["geometry_features"] = extract_geometry_features(points)
+        stats["geometry_status"] = "success"
+    except ValueError as error:
+        stats["geometry_status"] = "invalid_geometry"
+        print(f"Geometria non valida: {image_path.name} - {error}")
 
     overlay = image.copy()
     draw_landmarks(overlay, points)
@@ -406,7 +480,7 @@ def process_image(image_path, aspect, landmarker):
 
 def main():
     """
-    Campiona 100 palmi e 100 dorsi, esegue il test e crea il report CSV.
+    Elabora 100 palmi e 100 dorsi, estraendo ROI e geometria da entrambi.
     """
     csv_files = sorted(METADATA_DIR.glob("*.csv"))
 
@@ -420,22 +494,19 @@ def main():
         for path in DATASET_DIR.rglob("*.jpg")
     }
 
+    sample_path = OUTPUT_DIR / "campione_geometria.csv"
+    sample_df = pd.read_csv(sample_path)
+
     selected = []
 
-    for aspect_type in ["palmar", "dorsal"]:
-        candidates = df[
-            df["aspectOfHand"].str.startswith(aspect_type)
-            & df["imageName"].isin(image_files)
-        ]
+    for _, row in sample_df.iterrows():
+        image_path = image_files.get(row["imageName"])
 
-        sampled = candidates.sample(
-            n=100,
-            random_state=2026
-        )
+        if image_path is None:
+            print(f"Immagine non trovata: {row['imageName']}")
+            continue
 
-        for _, row in sampled.iterrows():
-            image_path = image_files[row["imageName"]]
-            selected.append((image_path, row))
+        selected.append((image_path, row))
 
     # soglie mediapipe predefinite
     options = vision.HandLandmarkerOptions(
@@ -449,6 +520,7 @@ def main():
     )
 
     results = []
+    geometry_results = []
 
     with vision.HandLandmarker.create_from_options(
         options
@@ -480,8 +552,18 @@ def main():
                     "roi_discarded": 0,
                     "max_size": None,
                     "rotation": None,
-                    "status": "processing_error"
+                    "status": "processing_error",
+                    "geometry_status": "not_attempted"
                 }
+
+            geometry = stats.pop("geometry_features", None)
+            if geometry is not None:
+                geometry_results.append({
+                    "imageName": row["imageName"],
+                    "id": row["id"],
+                    "aspectOfHand": row["aspectOfHand"],
+                    **geometry
+                })
 
             results.append({
                 "imageName": row["imageName"],
@@ -493,8 +575,11 @@ def main():
     # esporta statistiche utili per il preprocessing
     results_df = pd.DataFrame(results)
 
-    report_path = OUTPUT_DIR / "preprocessing_report.csv"
+    report_path = OUTPUT_DIR / "preprocessing_report_confronto.csv"
     results_df.to_csv(report_path, index=False)
+
+    geometry_path = OUTPUT_DIR / "geometry_features_confronto.csv"
+    pd.DataFrame(geometry_results).to_csv(geometry_path, index=False)
 
     print("\n===== RISULTATI FINALI =====")
 
@@ -519,7 +604,23 @@ def main():
     print(results_df["status"].value_counts())
 
     print(f"\nReport salvato in: {report_path}")
+    
+    geometry_df = pd.DataFrame(geometry_results)
 
+    print("\n===== ESTRAZIONE GEOMETRICA =====")
+
+    print(f"Immagini con geometria valida: {len(geometry_df)}")
+
+    if not geometry_df.empty:
+        print("\nPer superficie:")
+        print(
+            geometry_df["aspectOfHand"]
+            .str.split()
+            .str[0]
+            .value_counts()
+        )
+
+    print(f"Geometria estratta da: {len(geometry_results)} immagini")
 
 if __name__ == "__main__":
     main()
